@@ -18,9 +18,9 @@ Contiene los códigos de prueba iniciales, utilizados para verificar el funciona
 ### `imp_mqtt/`
 Contiene la implementación progresiva de la comunicación MQTT, agregando componentes de forma incremental:
 
-- **`code_act/`** — Primera integración de los sensores con la comunicación MQTT.
-- **`mqtt_demas/`** — Ampliación del código anterior, incorporando la lectura del resto de sensores vía MQTT.
+- **`mqtt_demas/`** — Primera integración de los sensores con la comunicación MQTT.
 - **`mqtt_demas_servo/`** — Se añade el control del servomotor al sistema con MQTT ya implementado.
+- **`code_act/`** — Actualización de la distribución de tareas entre los dos núcleos de la ESP32, además de corrección de errores en la lectura del sensor de flujo, implementando su lectura mediante interrupciones.
 
 ### `filtro_code/`
 Contiene la **versión final** del firmware (`filtro_code.ino`), que integra todos los desarrollos anteriores:
@@ -28,7 +28,7 @@ Contiene la **versión final** del firmware (`filtro_code.ino`), que integra tod
 - Lectura de todos los sensores (celda de carga y demás).
 - Comunicación MQTT.
 - Control del servomotor / servoválvula.
-- Filtro de Kalman para el procesamiento y reducción de ruido en las señales de los sensores.
+- Filtro de Kalman para el procesamiento y reducción de ruido en las señales de los sensores y en consecuencia, el cálculo de los grados brix.
 
 Esta es la versión utilizada actualmente en el prototipo.
 
