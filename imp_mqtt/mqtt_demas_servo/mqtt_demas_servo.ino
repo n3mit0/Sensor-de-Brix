@@ -1,0 +1,254 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>
+
+#include <Arduino.h>
+#include "HX711.h"
+
+// =========================
+// ENTRADAS SENSORES
+// =========================
+#define DT_PIN 4
+#define SCK_PIN 5
+#define FLOW_PIN 15  // GPIO D15 - YF-S401
+#define SERVO_PIN 16 // GPIO D16 - Servo
+
+// =========================
+// DATOS DE WIFI
+// =========================
+const char* ssid = "realme C67";
+const char* password = "jkgh23!;";
+
+// =========================
+// DATOS DEL BROKER MQTT
+// =========================
+const char* mqtt_server = "10.142.210.191";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "kalman_proj";
+
+
+// =========================
+// SENSOR BALANZA
+// =========================
+bool loadCellConnected = false;
+HX711 scale;
+float calibration_factor = 428.473;
+
+// --- Variables sensor de flujo ---
+volatile unsigned long pulseCount = 0;
+float PULSES_PER_LITER = 354.2;
+unsigned long lastFlowCalc = 0;
+float flowRate_Lmin = 0.0;
+float totalVolume_L = 0.0;
+
+void IRAM_ATTR pulseCounter() {
+  pulseCount++;
+}
+
+// =========================
+// SERVO
+// =========================
+Servo miServo;
+int anguloActual = 0;
+
+// =========================
+// CONTADOR (solo informativo, ya no limita el muestreo)
+// =========================
+unsigned long contador = 0;
+
+// =========================
+// OBJETOS WIFI Y MQTT
+// =========================
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// =========================
+// FUNCION: CONECTAR WIFI
+// =========================
+void setup_wifi() {
+  delay(100);
+  Serial.println();
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi conectado");
+  Serial.print("IP de la ESP32: ");
+  Serial.println(WiFi.localIP());
+}
+
+// =========================
+// FUNCION: RECONECTAR MQTT
+// =========================
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Conectando al broker MQTT... ");
+
+    String clientId = "ESP32Client-";
+    clientId += String(random(1000, 9999));
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("conectado");
+    } else {
+      Serial.print("fallo, rc=");
+      Serial.print(client.state());
+      Serial.println(" intentando nuevamente en 2 segundos");
+      delay(2000);
+    }
+  }
+}
+
+// =========================
+// FUNCION: LEER ANGULO DESDE SERIAL
+// =========================
+void leerServoDesdeSerial() {
+  if (Serial.available() > 0) {
+    int angulo = Serial.parseInt();
+
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+
+    if (angulo >= 0 && angulo <= 90) {
+      miServo.write(angulo);
+      anguloActual = angulo;
+      Serial.print("Servo movido a: ");
+      Serial.print(angulo);
+      Serial.println(" grados");
+    } else {
+      Serial.println("Valor invalido. Ingresa un numero entre 0 y 90.");
+    }
+  }
+}
+
+// =========================
+// SETUP
+// =========================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  setup_wifi();
+
+  client.setServer(mqtt_server, mqtt_port);
+
+  Serial.println("Inicio de adquisicion continua por MQTT");
+
+  // Servo
+  miServo.setPeriodHertz(50);
+  miServo.attach(SERVO_PIN, 500, 2400);
+  miServo.write(anguloActual);
+  Serial.println("Escribe un angulo entre 0 y 90 para mover el servo:");
+
+  // Celda de carga
+  scale.begin(DT_PIN, SCK_PIN);
+  Serial.println("Checking load cell...");
+  if (scale.wait_ready_timeout(200)) {
+    loadCellConnected = true;
+    scale.set_scale(calibration_factor);
+    Serial.println("Taring...");
+    scale.tare();
+    Serial.println("Tare complete.");
+  } else {
+    Serial.println("Load cell NOT detected. Reinicia la ESP32 despues de conectarla.");
+  }
+
+  // Sensor de flujo
+  pinMode(FLOW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
+
+  lastFlowCalc = millis();
+}
+
+// =========================
+// LOOP
+// =========================
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+
+  client.loop();
+
+  leerServoDesdeSerial();
+
+  // --- Lectura de la celda de carga (protegida del sensor de flujo) ---
+  float reading2 = 0;
+  static float lastValidWeight = 0;
+
+  if (loadCellConnected) {
+    // Pausamos brevemente la interrupcion del flujo para no corromper
+    // el timing de bit-banging del HX711
+    detachInterrupt(digitalPinToInterrupt(FLOW_PIN));
+
+    float reading1 = scale.get_units(5);
+    delay(50);
+    reading2 = scale.get_units(5);
+
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
+
+    if (abs(reading1 - reading2) < 2.0) {  // tolerancia un poco mas flexible
+      lastValidWeight = reading2;
+      Serial.print("Weight: ");
+      Serial.print(reading2, 2);
+      Serial.println(" g");
+    }
+    reading2 = lastValidWeight;
+  }
+
+  // --- Calculo del flujo cada 1 segundo ---
+  unsigned long now = millis();
+  if (now - lastFlowCalc >= 1000) {
+    detachInterrupt(digitalPinToInterrupt(FLOW_PIN));
+    unsigned long pulses = pulseCount;
+    pulseCount = 0;
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), pulseCounter, FALLING);
+
+    float elapsedSec = (now - lastFlowCalc) / 1000.0;
+    lastFlowCalc = now;
+
+    float litersThisInterval = pulses / PULSES_PER_LITER;
+    totalVolume_L += litersThisInterval;
+
+    flowRate_Lmin = (litersThisInterval / elapsedSec) * 60.0;
+
+    Serial.print("Flow: ");
+    Serial.print(flowRate_Lmin, 3);
+    Serial.print(" L/min | Total: ");
+    Serial.print(totalVolume_L, 3);
+    Serial.println(" L");
+  }
+
+  // Convertir floats a texto
+  char mensajeweight[12];
+  if (loadCellConnected) {
+    dtostrf(reading2, 5, 2, mensajeweight);
+  } else {
+    strcpy(mensajeweight, "NA");
+  }
+
+  char mensajeflow[12];
+  dtostrf(flowRate_Lmin, 8, 3, mensajeflow);
+
+  // Armar mensaje combinado
+  char mensaje[64];
+  snprintf(mensaje, sizeof(mensaje), "angle: %d weight: %s flow: %s", anguloActual, mensajeweight, mensajeflow);
+
+  // Publicar mensaje combinado
+  client.publish(mqtt_topic, mensaje);
+
+  contador++;
+  Serial.print("Muestra ");
+  Serial.print(contador);
+  Serial.print(": ");
+  Serial.println(mensaje);
+
+  delay(300);
+}
